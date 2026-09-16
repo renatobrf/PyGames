@@ -1,0 +1,8 @@
+Crie um jogo em Python usando Pygame, com visual inspirado em 16 bits.
+Desenvolva um jogo de tabuleiro em Pygame chamado Corrida dos Peões. O tabuleiro deve ser um tabuleiro de xadrez padrão, com 8 colunas e 8 linhas. 
+Cada jogador controla uma fileira de peões, posicionados na linha inicial dos peões no xadrez (2ª linha para as brancas e 7ª linha para as pretas). 
+Os peões se movem de forma normal, avançando uma casa por vez, e capturam na diagonal. O objetivo é levar um dos seus peões até o outro lado do tabuleiro. O jogo termina quando o primeiro peão alcançar a última fileira do adversário. 
+Incluir um controle de turno entre os jogadores, animações simples para o movimento dos peões, e uma mensagem de vitória quando o jogo acabar.
+Criar um mecanismo de inteligencia para agir como o segundo jogador, assim uma pessoa consegue interagir com o jogo de modo single player.
+Criar o arquivo de saida: pawn_sprint.py
+Gerar uma doc do jogo no arquivo: doc-pawn-sprint.md

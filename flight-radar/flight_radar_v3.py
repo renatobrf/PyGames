@@ -1,17 +1,21 @@
 """
-Flight Radar v2 - 16-bit inspired ATC radar game
+Flight Radar v3 - 16-bit inspired ATC radar game
 Controls:
   A / Enter - Accept the approaching aircraft  (+10 pts, streak bonus)
   D         - Deny / reroute the aircraft      (+5 pts)
   Tab       - Cycle selection between approaching aircraft
   Q / ESC   - Quit
 
-Score system (v2):
+Score system (v3):
   Accept (land)   : +10 base points  × streak multiplier
   Deny (reroute)  : +5  points       (no streak)
   Incident        : -20 points, streak reset
   Streak bonus    : every 5 consecutive accepts → +25 bonus pts
   Accuracy        : cleared / (cleared + incidents) × 100 %
+
+v3 addition:
+  GAME OVER       : triggered when score drops below 0
+                    Shows summary overlay and prompts [Y] New Game / [N] Quit
 """
 
 import pygame
@@ -23,7 +27,7 @@ import sys
 WIDTH, HEIGHT = 800, 700          # extra 50 px at bottom for score bar
 FPS = 60
 
-# Radar geometry (same as v1)
+# Radar geometry
 RADAR_CX, RADAR_CY = WIDTH // 2, HEIGHT // 2 - 55
 RADAR_RADIUS = 270
 
@@ -45,6 +49,10 @@ SCORE_SILVER = (160, 200, 160)
 SCORE_DIM    = (60,  80,  60)
 SCORE_RED    = (200, 50,  50)
 SCORE_STREAK = (255, 180, 0)
+
+# Game states
+GAME_PLAYING   = "playing"
+GAME_OVER      = "game_over"
 
 # Aircraft state machine
 STATE_APPROACHING = "approaching"
@@ -282,9 +290,10 @@ class ScoreState:
         # deny does NOT reset streak
 
     def add_incident(self):
+        """v3: score CAN go negative — that triggers Game Over."""
         self.incidents += 1
         self.streak = 0
-        self.points  = max(0, self.points + PTS_INCIDENT)
+        self.points += PTS_INCIDENT          # no floor — negative score allowed
         self.last_delta  = PTS_INCIDENT
         self.delta_timer = 2.0
 
@@ -312,11 +321,12 @@ def draw_top_bar(surface: pygame.Surface, fonts, score: ScoreState,
     font_small = fonts["small"]
 
     pygame.draw.line(surface, MED_GREEN, (0, 20), (WIDTH, 20), 1)
-    title = font_med.render("AIR TRAFFIC CONTROL — RADAR v2.0", True, GREEN)
+    title = font_med.render("AIR TRAFFIC CONTROL — RADAR v3.0", True, GREEN)
     surface.blit(title, (WIDTH // 2 - title.get_width() // 2, 3))
 
-    # Points top-left
-    pts_txt = font_small.render(f"PTS: {score.points:>6}", True, SCORE_GOLD)
+    # Points top-left (red if negative)
+    pts_col = SCORE_RED if score.points < 0 else SCORE_GOLD
+    pts_txt = font_small.render(f"PTS: {score.points:>6}", True, pts_col)
     surface.blit(pts_txt, (10, 5))
 
     # Incidents top-right
@@ -407,11 +417,12 @@ def draw_score_footer(surface: pygame.Surface, fonts, score: ScoreState):
     pygame.draw.rect(surface, (0, 15, 0), (0, bar_y, WIDTH, bar_h))
 
     # ── Column layout ──────────────────────────────────────────────────────
-    # Col 1: Total points (big)
-    col1_x = 20
+    # Col 1: Total points (big) — red when negative
+    col1_x  = 20
+    pts_col = SCORE_RED if score.points < 0 else SCORE_GOLD
     pts_label = font_small.render("SCORE", True, DIM_GREEN)
     surface.blit(pts_label, (col1_x, bar_y + 6))
-    pts_val = font_big.render(f"{score.points:>6}", True, SCORE_GOLD)
+    pts_val = font_big.render(f"{score.points:>6}", True, pts_col)
     surface.blit(pts_val, (col1_x, bar_y + 20))
 
     # Floating delta
@@ -424,7 +435,6 @@ def draw_score_footer(surface: pygame.Surface, fonts, score: ScoreState):
             delta_col = tuple(int(c * alpha_frac) for c in SCORE_RED)
             delta_str = str(score.last_delta)
         delta_txt = font_med.render(delta_str, True, delta_col)
-        # Float upward as timer decays
         float_y = bar_y + 18 - int((2.0 - score.delta_timer) * 12)
         surface.blit(delta_txt, (col1_x + 90, float_y))
 
@@ -472,7 +482,6 @@ def draw_score_footer(surface: pygame.Surface, fonts, score: ScoreState):
     # ── Col 4: Streak + Time ──────────────────────────────────────────────
     col4_x = 625
 
-    # Streak
     streak_col = SCORE_STREAK if score.streak >= 3 else (
                  UI_GREEN     if score.streak >= 1 else SCORE_DIM)
     surface.blit(font_small.render("STREAK", True, DIM_GREEN), (col4_x, bar_y + 6))
@@ -548,7 +557,6 @@ class StreakBurst:
         txt   = font.render(self.message, True, col)
         x     = WIDTH  // 2 - txt.get_width()  // 2
         y     = HEIGHT // 2 - txt.get_height() // 2
-        # Dim backing rect
         backing = pygame.Surface((txt.get_width() + 24, txt.get_height() + 10),
                                   pygame.SRCALPHA)
         backing.fill((0, 0, 0, int(180 * alpha)))
@@ -556,11 +564,115 @@ class StreakBurst:
         surface.blit(txt, (x, y))
 
 
+# ── Game Over overlay ─────────────────────────────────────────────────────────
+def draw_game_over(surface: pygame.Surface, fonts, score: ScoreState,
+                   blink_timer: float):
+    """
+    Semi-transparent Game Over screen drawn on top of the frozen radar.
+    Shows final score summary and prompts the player to start a new game
+    or quit.
+
+    blink_timer: accumulated time in seconds — drives the blinking prompt.
+    """
+    font_big   = fonts["big"]
+    font_med   = fonts["med"]
+    font_small = fonts["small"]
+
+    # ── Dark overlay ─────────────────────────────────────────────────────────
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 210))
+    surface.blit(overlay, (0, 0))
+
+    # ── Red alert border ──────────────────────────────────────────────────────
+    pygame.draw.rect(surface, RED_ALERT, (30, 60, WIDTH - 60, HEIGHT - 120), 2,
+                     border_radius=6)
+
+    cx = WIDTH // 2
+
+    # ── GAME OVER title ───────────────────────────────────────────────────────
+    title_font = pygame.font.SysFont("Courier New", 52, bold=True)
+    title_txt  = title_font.render("GAME  OVER", True, RED_ALERT)
+    surface.blit(title_txt, (cx - title_txt.get_width() // 2, 80))
+
+    # Subtitle
+    sub = font_med.render("SCORE DROPPED BELOW ZERO — SECTOR LOST", True, (180, 80, 80))
+    surface.blit(sub, (cx - sub.get_width() // 2, 148))
+
+    # ── Separator ─────────────────────────────────────────────────────────────
+    pygame.draw.line(surface, MED_GREEN, (60, 170), (WIDTH - 60, 170), 1)
+
+    # ── Stats block ───────────────────────────────────────────────────────────
+    stats_y = 188
+    line_gap = 26
+
+    def stat_row(label: str, value: str, color, y_pos: int):
+        lbl_surf = font_small.render(label, True, DIM_GREEN)
+        val_surf = font_med.render(value, True, color)
+        surface.blit(lbl_surf, (cx - 220, y_pos))
+        surface.blit(val_surf, (cx - 220 + 200, y_pos - 2))
+
+    stat_row("FINAL SCORE  :",
+             f"{score.points:>6} pts",
+             SCORE_RED if score.points < 0 else SCORE_GOLD,
+             stats_y)
+    stat_row("TIME PLAYED  :",
+             score.elapsed_str,
+             UI_GREEN, stats_y + line_gap)
+    stat_row("CLEARED      :",
+             str(score.cleared),
+             BRIGHT_GREEN, stats_y + line_gap * 2)
+    stat_row("REROUTED     :",
+             str(score.rerouted),
+             UI_GREEN, stats_y + line_gap * 3)
+    stat_row("INCIDENTS    :",
+             str(score.incidents),
+             RED_ALERT, stats_y + line_gap * 4)
+    stat_row("ACCURACY     :",
+             f"{score.accuracy:.1f}%",
+             BRIGHT_GREEN if score.accuracy >= 80 else
+             ALERT_GREEN  if score.accuracy >= 50 else RED_ALERT,
+             stats_y + line_gap * 5)
+    stat_row("BEST STREAK  :",
+             f"×{score.best_streak}",
+             SCORE_STREAK, stats_y + line_gap * 6)
+
+    # ── Separator ─────────────────────────────────────────────────────────────
+    pygame.draw.line(surface, MED_GREEN,
+                     (60, stats_y + line_gap * 7 + 4),
+                     (WIDTH - 60, stats_y + line_gap * 7 + 4), 1)
+
+    # ── Blinking prompt ───────────────────────────────────────────────────────
+    prompt_y = stats_y + line_gap * 7 + 18
+    show_prompt = int(blink_timer * 2) % 2 == 0   # blinks at ~2 Hz
+
+    if show_prompt:
+        prompt_txt = font_med.render(
+            "[Y]  NEW GAME          [N]  QUIT", True, ALERT_GREEN)
+        surface.blit(prompt_txt, (cx - prompt_txt.get_width() // 2, prompt_y))
+
+    # Hint line below
+    hint = font_small.render("press Y to restart or N / ESC to exit", True, DIM_GREEN)
+    surface.blit(hint, (cx - hint.get_width() // 2, prompt_y + 28))
+
+
+# ── Helper: reset all game state for a new session ────────────────────────────
+def new_game_state():
+    """Return fresh (aircraft_list, effects, score, sweep, streak_burst,
+    spawn_timer, spawn_interval, active_idx)."""
+    Aircraft._id_counter = 0
+    aircraft   = [Aircraft()]
+    effects    = []
+    score      = ScoreState()
+    sweep      = RadarSweep()
+    streak_burst = StreakBurst()
+    return aircraft, effects, score, sweep, streak_burst, 0.0, 5.0, 0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Flight Radar v2 — ATC")
+    pygame.display.set_caption("Flight Radar v3 — ATC")
     clock  = pygame.time.Clock()
 
     fonts = {
@@ -569,17 +681,13 @@ def main():
         "small": pygame.font.SysFont("Courier New", 11),
     }
 
-    sweep        = RadarSweep()
-    aircraft: list[Aircraft]     = []
-    effects:  list[FlashEffect]  = []
-    score        = ScoreState()
-    streak_burst = StreakBurst()
+    # ── Initial game state ────────────────────────────────────────────────────
+    (aircraft, effects, score,
+     sweep, streak_burst,
+     spawn_timer, spawn_interval, active_idx) = new_game_state()
 
-    spawn_timer    = 0.0
-    spawn_interval = 5.0
-    active_idx     = 0
-
-    aircraft.append(Aircraft())
+    game_state     = GAME_PLAYING
+    gameover_blink = 0.0   # drives the blinking prompt on the game-over screen
 
     running = True
     while running:
@@ -591,33 +699,71 @@ def main():
                 running = False
 
             elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    running = False
 
-                elif event.key == pygame.K_TAB:
-                    approaching = [a for a in aircraft if a.state == STATE_APPROACHING]
-                    if approaching:
-                        active_idx = (active_idx + 1) % len(approaching)
+                # ── Game Over screen key handling ─────────────────────────────
+                if game_state == GAME_OVER:
+                    if event.key == pygame.K_y:
+                        # Restart: rebuild everything from scratch
+                        (aircraft, effects, score,
+                         sweep, streak_burst,
+                         spawn_timer, spawn_interval,
+                         active_idx) = new_game_state()
+                        game_state     = GAME_PLAYING
+                        gameover_blink = 0.0
 
-                elif event.key in (pygame.K_a, pygame.K_RETURN):
-                    approaching = [a for a in aircraft if a.state == STATE_APPROACHING]
-                    if approaching:
-                        ac  = approaching[active_idx % len(approaching)]
-                        ac.accept()
-                        got_bonus = score.add_accept()
-                        effects.append(FlashEffect(ac.x, ac.y, (100, 255, 120),
-                                                   f"CLEARED +{PTS_ACCEPT}"))
-                        if got_bonus:
-                            streak_burst.trigger(score.streak)
+                    elif event.key in (pygame.K_n, pygame.K_ESCAPE, pygame.K_q):
+                        running = False
 
-                elif event.key == pygame.K_d:
-                    approaching = [a for a in aircraft if a.state == STATE_APPROACHING]
-                    if approaching:
-                        ac  = approaching[active_idx % len(approaching)]
-                        ac.deny()
-                        score.add_deny()
-                        effects.append(FlashEffect(ac.x, ac.y, (180, 180, 50),
-                                                   f"REROUTED +{PTS_DENY}"))
+                # ── Normal play key handling ──────────────────────────────────
+                else:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+
+                    elif event.key == pygame.K_TAB:
+                        approaching = [a for a in aircraft
+                                       if a.state == STATE_APPROACHING]
+                        if approaching:
+                            active_idx = (active_idx + 1) % len(approaching)
+
+                    elif event.key in (pygame.K_a, pygame.K_RETURN):
+                        approaching = [a for a in aircraft
+                                       if a.state == STATE_APPROACHING]
+                        if approaching:
+                            ac  = approaching[active_idx % len(approaching)]
+                            ac.accept()
+                            got_bonus = score.add_accept()
+                            effects.append(FlashEffect(ac.x, ac.y,
+                                                       (100, 255, 120),
+                                                       f"CLEARED +{PTS_ACCEPT}"))
+                            if got_bonus:
+                                streak_burst.trigger(score.streak)
+
+                    elif event.key == pygame.K_d:
+                        approaching = [a for a in aircraft
+                                       if a.state == STATE_APPROACHING]
+                        if approaching:
+                            ac  = approaching[active_idx % len(approaching)]
+                            ac.deny()
+                            score.add_deny()
+                            effects.append(FlashEffect(ac.x, ac.y,
+                                                       (180, 180, 50),
+                                                       f"REROUTED +{PTS_DENY}"))
+
+        # ── Skip simulation updates while on game-over screen ─────────────────
+        if game_state == GAME_OVER:
+            gameover_blink += dt
+            screen.fill(BLACK)
+            pygame.draw.circle(screen, DARK_GREEN, (RADAR_CX, RADAR_CY), RADAR_RADIUS)
+            draw_radar_bg(screen, fonts["small"])
+            # Frozen aircraft (no update, just draw)
+            for ac in aircraft:
+                ac.draw(screen)
+            draw_top_bar(screen, fonts, score, aircraft, active_idx)
+            draw_flight_panel(screen, fonts, aircraft, active_idx)
+            draw_score_footer(screen, fonts, score)
+            draw_game_over(screen, fonts, score, gameover_blink)
+            pygame.display.flip()
+            continue
 
         # ── Spawn ─────────────────────────────────────────────────────────────
         spawn_timer += dt
@@ -643,13 +789,19 @@ def main():
             ac.update(dt)
             if was_approaching and ac.state == STATE_GONE:
                 score.add_incident()
-                effects.append(FlashEffect(RADAR_CX, RADAR_CY, (220, 60, 60), "INCIDENT!"))
+                effects.append(FlashEffect(RADAR_CX, RADAR_CY,
+                                           (220, 60, 60), "INCIDENT!"))
 
         for ef in effects:
             ef.update(dt)
 
         aircraft = [a for a in aircraft if not a.is_dead()]
         effects  = [e for e in effects  if not e.is_dead()]
+
+        # ── Check for Game Over (score went below zero) ────────────────────────
+        if score.points < 0:
+            game_state = GAME_OVER
+            gameover_blink = 0.0
 
         # ── Draw ──────────────────────────────────────────────────────────────
         screen.fill(BLACK)

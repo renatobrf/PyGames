@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frog Crossing</title>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #111;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+      font-family: 'Press Start 2P', monospace;
+    }
+    canvas { display: block; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ── Layout ─────────────────────────────────────────────────────────────────────
+const LW = 480, LH = 640;
+const COLS = 9, ROWS = 9;                // grid columns, playfield rows (0=bottom)
+const HUD_H  = 58;                       // top HUD height
+const CELL   = LW / COLS;               // ~53 px
+const ROW_H  = (LH - HUD_H) / ROWS;    // per row height
+
+// Row 0 = bottom safe, 1-3 = road, 4 = median, 5-7 = river, 8 = goal
+const ROW_TYPE = ['safe','road','road','road','safe','river','river','river','goal'];
+const ROW_COL  = { safe:'#2d6a2d', road:'#3a3a3a', river:'#1a4a7a', goal:'#1a6e1a' };
+
+const GOAL_SLOTS  = 5;
+const MAX_LIVES   = 3;
+const TIMER_MAX   = 30;
+
+// ── Canvas ─────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+function resize() {
+  const r = window.devicePixelRatio || 1;
+  const s = Math.min(window.innerWidth / LW, window.innerHeight / LH);
+  canvas.width  = LW * s * r; canvas.height = LH * s * r;
+  canvas.style.width  = LW * s + 'px';
+  canvas.style.height = LH * s + 'px';
+  ctx.setTransform(s * r, 0, 0, s * r, 0, 0);
+}
+window.addEventListener('resize', resize); resize();
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+const rand = (a, b) => Math.random() * (b - a) + a;
+function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } }
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+
+function rowTop(r) { return HUD_H + (ROWS - 1 - r) * ROW_H; }
+function colX(c)   { return c * CELL; }
+
+function rrect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y); ctx.arcTo(x+w, y, x+w, y+r, r);
+  ctx.lineTo(x+w, y+h-r); ctx.arcTo(x+w, y+h, x+w-r, y+h, r);
+  ctx.lineTo(x+r, y+h); ctx.arcTo(x, y+h, x, y+h-r, r);
+  ctx.lineTo(x, y+r); ctx.arcTo(x, y, x+r, y, r);
+  ctx.closePath();
+}
+
+function txt(t, x, y, sz, col, align='left') {
+  ctx.font = `${sz}px 'Press Start 2P',monospace`;
+  ctx.fillStyle = col; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillText(t, x, y);
+}
+
+// ── Lane entities ──────────────────────────────────────────────────────────────
+class Entity {
+  constructor(row, x, w, spd, col, isLog, isLily) {
+    this.row = row; this.x = x; this.w = w; this.spd = spd;
+    this.col = col; this.isLog = isLog; this.isLily = isLily;
+    this.y = rowTop(row) + ROW_H / 2;
+    this.h = ROW_H * (isLily ? 0.75 : 0.70);
+  }
+  update(dt) {
+    this.x += this.spd * dt;
+    if (this.spd > 0 && this.x > LW + this.w)  this.x = -this.w;
+    if (this.spd < 0 && this.x < -this.w)       this.x = LW + this.w;
+  }
+  over(fx, fy) {
+    return fx > this.x - this.w*0.55 && fx < this.x + this.w*0.55 &&
+           fy > this.y - ROW_H*0.45  && fy < this.y + ROW_H*0.45;
+  }
+  draw() {
+    if (this.isLily) {
+      ctx.fillStyle = '#0e5c1a'; ctx.strokeStyle = '#0a3a10'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(this.x, this.y, CELL*0.38, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#1a4a7a';
+      ctx.beginPath(); ctx.moveTo(this.x, this.y); ctx.arc(this.x, this.y, CELL*0.38, -0.3, 0.3); ctx.closePath(); ctx.fill();
+      return;
+    }
+    const r = this.isLog ? 8 : 4;
+    ctx.fillStyle = this.col; ctx.strokeStyle = this.isLog ? '#5a3010' : '#555'; ctx.lineWidth = 1.5;
+    rrect(this.x - this.w/2, this.y - this.h/2, this.w, this.h, r);
+    ctx.fill(); ctx.stroke();
+    if (!this.isLog && this.w > 40) {
+      ctx.fillStyle = 'rgba(150,210,255,0.5)';
+      const ww = Math.min(20, this.w*0.3), wh = this.h*0.35;
+      rrect(this.x - this.w/2 + 6, this.y - wh/2, ww, wh, 2);
+      ctx.fill();
+    }
+  }
+}
+
+function buildLanes(level) {
+  const mul = 1 + (level-1)*0.10, ext = level - 1;
+  const all = [];
+  const road = [
+    {row:1, spd: 110*mul, col:'#cc2222', w:CELL*1.8, isLog:false, isLily:false},
+    {row:2, spd:-130*mul, col:'#2266cc', w:CELL*2.8, isLog:false, isLily:false},
+    {row:3, spd:  90*mul, col:'#cc8822', w:CELL*1.5, isLog:false, isLily:false},
+  ];
+  const river = [
+    {row:5, spd: 80*mul, col:'#6b3a1f', w:CELL*2.5, isLog:true,  isLily:false},
+    {row:6, spd:-100*mul, col:'#5a3010', w:CELL*3.5, isLog:true,  isLily:false},
+    {row:7, spd: 70*mul, col:'#0e5c1a', w:CELL*1.2, isLog:false, isLily:true},
+  ];
+  for (const cfg of [...road, ...river]) {
+    const n = 3 + ext;
+    for (let i = 0; i < n; i++) {
+      const sp = LW / n;
+      const x  = i * sp + rand(0, sp * 0.5);
+      all.push(new Entity(cfg.row, x, cfg.w, cfg.spd, cfg.col, cfg.isLog, cfg.isLily));
+    }
+  }
+  return all;
+}
+
+// ── Frog ───────────────────────────────────────────────────────────────────────
+function drawFrog(x, y, col) {
+  const s = CELL * 0.38;
+  ctx.fillStyle = col; ctx.strokeStyle = '#1a7a30'; ctx.lineWidth = 1.5;
+  rrect(x-s, y-s*0.85, s*2, s*1.7, s*0.45); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(x-s*0.45, y-s*0.55, s*0.22, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+s*0.45, y-s*0.55, s*0.22, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(x-s*0.42, y-s*0.55, s*0.10, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+s*0.42, y-s*0.55, s*0.10, 0, Math.PI*2); ctx.fill();
+}
+
+class Frog {
+  constructor() { this.reset(); }
+  reset() {
+    this.gc = Math.floor(COLS/2); this.gr = 0;
+    this.x  = colX(this.gc) + CELL/2;
+    this.y  = rowTop(0) + ROW_H/2;
+    this.tx = this.x; this.ty = this.y;
+    this.rideVx = 0; this.alive = true;
+    this.deathT = 0; this.deathKind = '';
+  }
+  hop(dc, dr) {
+    if (!this.alive || this.deathT > 0) return;
+    const nc = this.gc + dc, nr = this.gr + dr;
+    if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS) return;
+    this.gc = nc; this.gr = nr;
+    this.tx = colX(nc) + CELL/2;
+    this.ty = rowTop(nr) + ROW_H/2;
+  }
+  update(dt) {
+    if (this.deathT > 0) { this.deathT -= dt; return; }
+    const k = Math.min(1, 14 * dt);
+    this.x += (this.tx - this.x) * k;
+    this.y += (this.ty - this.y) * k;
+    this.x  += this.rideVx * dt;
+    this.tx += this.rideVx * dt;
+    this.x  = Math.max(CELL/2, Math.min(LW - CELL/2, this.x));
+    this.tx = Math.max(CELL/2, Math.min(LW - CELL/2, this.tx));
+    this.rideVx = 0;
+  }
+  die(kind) {
+    if (this.deathT > 0) return;
+    this.alive = false; this.deathT = 0.8; this.deathKind = kind;
+  }
+  draw() {
+    if (this.deathT > 0) {
+      if (this.deathKind === 'drown') {
+        const p = this.deathT / 0.8;
+        ctx.globalAlpha = p;
+        ctx.save(); ctx.translate(this.x, this.y); ctx.scale(p, p);
+        drawFrog(0, 0, '#22aa44');
+        ctx.restore(); ctx.globalAlpha = 1;
+      } else {
+        if (Math.floor(this.deathT / 0.12) % 2 === 0) drawFrog(this.x, this.y, '#ff3333');
+      }
+      return;
+    }
+    drawFrog(this.x, this.y, '#33cc55');
+  }
+}
+
+// ── Game state ─────────────────────────────────────────────────────────────────
+let state, score, lives, level, timer, lastTime;
+let frog, entities, filled, flashT;
+
+function initLevel() {
+  frog = new Frog(); entities = buildLanes(level);
+  filled = new Array(GOAL_SLOTS).fill(false); timer = TIMER_MAX;
+}
+function newGame() {
+  score = 0; lives = MAX_LIVES; level = 1; initLevel();
+  state = 'playing'; lastTime = performance.now();
+}
+function nextLevel() { level++; score += 200; initLevel(); state = 'playing'; }
+function endGame() {
+  const b = lsGet('fc_best', 0);
+  if (score > b) lsSet('fc_best', score);
+  state = 'gameover';
+}
+
+// ── Input ──────────────────────────────────────────────────────────────────────
+const keys = {}; let swipe = null;
+
+window.addEventListener('keydown', e => {
+  if (keys[e.key]) return; keys[e.key] = true;
+  if (state === 'start' || state === 'gameover') { newGame(); return; }
+  if (state === 'levelclear') { nextLevel(); return; }
+  if (state !== 'playing') return;
+  const m = {ArrowUp:'u',w:'u',W:'u',ArrowDown:'d',s:'d',S:'d',ArrowLeft:'l',a:'l',A:'l',ArrowRight:'r',d:'r',D:'r'};
+  const dir = m[e.key];
+  if (dir==='u') frog.hop(0, 1); if (dir==='d') frog.hop(0,-1);
+  if (dir==='l') frog.hop(-1,0); if (dir==='r') frog.hop( 1, 0);
+  if ([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+canvas.addEventListener('touchstart', e => {
+  swipe = {x: e.touches[0].clientX, y: e.touches[0].clientY};
+  if (state !== 'playing') { newGame(); swipe = null; }
+}, {passive:true});
+canvas.addEventListener('touchend', e => {
+  if (!swipe || state !== 'playing') { swipe = null; return; }
+  const dx = e.changedTouches[0].clientX - swipe.x;
+  const dy = e.changedTouches[0].clientY - swipe.y;
+  swipe = null;
+  if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+  if (Math.abs(dx) > Math.abs(dy)) frog.hop(dx > 0 ? 1 : -1, 0);
+  else                              frog.hop(0, dy < 0 ? 1 : -1);
+}, {passive:true});
+
+// ── Update ─────────────────────────────────────────────────────────────────────
+function update(dt) {
+  timer -= dt;
+  if (timer <= 0) {
+    timer = TIMER_MAX; lives--;
+    if (lives <= 0) { endGame(); return; }
+    frog.reset(); return;
+  }
+
+  for (const e of entities) e.update(dt);
+
+  // Ride / drown logic
+  if (frog.alive && !frog.deathT) {
+    if (ROW_TYPE[frog.gr] === 'river') {
+      let on = false;
+      for (const e of entities) {
+        if (e.row === frog.gr && e.over(frog.x, frog.y)) {
+          frog.rideVx = e.spd; on = true; break;
+        }
+      }
+      if (!on) frog.die('drown');
+    }
+    // Road collision
+    if (ROW_TYPE[frog.gr] === 'road') {
+      for (const e of entities) {
+        if (e.row === frog.gr && e.over(frog.x, frog.y)) { frog.die('road'); break; }
+      }
+    }
+  }
+
+  frog.update(dt);
+
+  // Resolve death
+  if (!frog.alive && frog.deathT <= 0) {
+    lives--;
+    if (lives <= 0) { endGame(); return; }
+    frog.reset(); timer = TIMER_MAX;
+  }
+
+  // Goal check
+  if (frog.alive && frog.gr === 8) {
+    const slot = Math.max(0, Math.min(GOAL_SLOTS-1, Math.round((frog.x - CELL/2) / (LW / GOAL_SLOTS))));
+    if (!filled[slot]) {
+      filled[slot] = true;
+      score += 100 + Math.floor(timer) * 10;
+      timer  = TIMER_MAX;
+      frog.reset();
+      if (filled.every(Boolean)) {
+        const b = lsGet('fc_best', 0);
+        if (score > b) lsSet('fc_best', score);
+        state = 'levelclear'; flashT = 2.5;
+      }
+    } else {
+      frog.hop(0, -1);
+    }
+  }
+}
+
+// ── Draw ───────────────────────────────────────────────────────────────────────
+function drawGame() {
+  for (let r = 0; r < ROWS; r++) {
+    ctx.fillStyle = ROW_COL[ROW_TYPE[r]]; ctx.fillRect(0, rowTop(r), LW, ROW_H);
+  }
+  // dashed road lines
+  ctx.strokeStyle = '#ffffff33'; ctx.lineWidth = 1; ctx.setLineDash([8,10]);
+  for (const r of [1,2,3]) {
+    ctx.beginPath(); ctx.moveTo(0, rowTop(r)+ROW_H); ctx.lineTo(LW, rowTop(r)+ROW_H); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // goal slots
+  const sw = LW / GOAL_SLOTS;
+  for (let i = 0; i < GOAL_SLOTS; i++) {
+    const sx = i * sw + sw/2, sy = rowTop(8) + ROW_H/2;
+    if (filled[i]) {
+      drawFrog(sx, sy, '#66ee88');
+    } else {
+      ctx.fillStyle = '#0e5c1a'; ctx.strokeStyle = '#0a3a10'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(sx, sy, CELL*0.38, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+  }
+
+  for (const e of entities) e.draw();
+  frog.draw();
+
+  // HUD
+  ctx.fillStyle = '#111'; ctx.fillRect(0, 0, LW, HUD_H);
+  txt(`${score}`, 8, 20, 9, '#fff', 'left');
+  txt(`LV${level}`, LW/2, 20, 9, '#ffdd44', 'center');
+  txt('♥'.repeat(lives) + '♡'.repeat(MAX_LIVES - lives), LW-8, 20, 10, '#ff4444', 'right');
+
+  // Timer bar
+  const bw = LW - 16;
+  const fill = Math.max(0, (timer / TIMER_MAX) * bw);
+  const barCol = timer > 10 ? '#33cc55' : timer > 5 ? '#ffaa00' : '#ff3333';
+  ctx.fillStyle = '#333'; rrect(8, 38, bw, 12, 4); ctx.fill();
+  if (fill > 0) { ctx.fillStyle = barCol; rrect(8, 38, fill, 12, 4); ctx.fill(); }
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 1; rrect(8, 38, bw, 12, 4); ctx.stroke();
+}
+
+function drawOverlay(title, tcol, s1, s2, hint) {
+  ctx.fillStyle = 'rgba(0,0,0,0.72)'; ctx.fillRect(0, 0, LW, LH);
+  ctx.shadowColor = tcol; ctx.shadowBlur = 20;
+  txt(title, LW/2, LH/2 - 90, 22, tcol, 'center');
+  ctx.shadowBlur = 0;
+  if (s1) txt(s1, LW/2, LH/2 - 20, 11, '#fff', 'center');
+  if (s2) txt(s2, LW/2, LH/2 + 20, 10, '#ffdd44', 'center');
+  ctx.strokeStyle = '#4466ff'; ctx.lineWidth = 2;
+  const bx = LW/2-100, by = LH/2+60;
+  rrect(bx, by, 200, 40, 6); ctx.stroke();
+  if (hint) txt(hint, LW/2, by + 20, 9, '#fff', 'center');
+  ctx.globalAlpha = 0.45 + 0.45 * Math.sin(performance.now() / 420);
+  txt('SPACE / TAP', LW/2, LH/2 + 150, 8, '#aaddff', 'center');
+  ctx.globalAlpha = 1;
+}
+
+function drawStart() {
+  ctx.fillStyle = '#183018'; ctx.fillRect(0, 0, LW, LH);
+  for (let r = 0; r < ROWS; r++) {
+    ctx.fillStyle = (ROW_COL[ROW_TYPE[r]] || '#333') + '44';
+    ctx.fillRect(0, rowTop(r), LW, ROW_H);
+  }
+  ctx.shadowColor = '#33ff66'; ctx.shadowBlur = 22;
+  txt('FROG',     LW/2, LH/2 - 80, 34, '#33ff66', 'center');
+  txt('CROSSING', LW/2, LH/2 - 38, 20, '#33ff66', 'center');
+  ctx.shadowBlur = 0;
+  const best = lsGet('fc_best', 0);
+  txt(`BEST: ${best}`, LW/2, LH/2 + 20, 10, '#ffdd44', 'center');
+  ctx.globalAlpha = 0.45 + 0.45 * Math.sin(performance.now() / 420);
+  txt('SPACE / TAP TO START', LW/2, LH/2 + 80, 7, '#aaddff', 'center');
+  ctx.globalAlpha = 1;
+}
+
+// ── Loop ───────────────────────────────────────────────────────────────────────
+function loop(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.1); lastTime = now;
+  ctx.clearRect(0, 0, LW, LH);
+
+  if (state === 'start') {
+    drawStart();
+  } else if (state === 'playing') {
+    update(dt); drawGame();
+  } else if (state === 'levelclear') {
+    flashT -= dt; drawGame();
+    drawOverlay('LEVEL CLEAR!', '#33ff66', `SCORE: ${score}`, `LEVEL ${level} DONE`, 'NEXT LEVEL');
+    if (flashT <= 0) nextLevel();
+  } else if (state === 'gameover') {
+    drawGame();
+    drawOverlay('GAME OVER', '#ff3322', `SCORE: ${score}`, `BEST: ${lsGet('fc_best',0)}`, 'RESTART');
+  }
+
+  requestAnimationFrame(loop);
+}
+
+// ── Boot ───────────────────────────────────────────────────────────────────────
+state = 'start'; lastTime = performance.now();
+frog = new Frog(); entities = [];
+document.fonts.ready.then(() => requestAnimationFrame(loop));
+</script>
+</body>
+</html>
