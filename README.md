@@ -1,4 +1,4 @@
-# PyGame
+# PyGames
 
 A collection of small games and interactive prototypes built with [Pygame](https://www.pygame.org/). The repository currently contains two 16-bit adventure games and four 8-bit market simulations.
 
